@@ -56,8 +56,22 @@
 // number of simultaneous telnet connections used - up to 256
 #define MAX_NUM_TELNET_INST   2 // user defined
 
+
+typedef struct
+{
+  struct tcp_pcb* telnet_pcb;
+  struct tcp_pcb* host_pcb;
+  uint16_t tcp_port;
+  StreamBufferHandle_t serial_input_stream;
+  StreamBufferHandle_t tcp_input_stream;
+
+} telnet_t;
+
+
 // this function should be called once for each telnet connection
-void telnet_create (uint16_t port, UART_HandleTypeDef* serial_handler);
+void telnet_create( telnet_t* instance, uint16_t port );
+
+void telnet_transmit_char(telnet_t* instance, char character);
 
 // Extra application: UDP echo server
 void udp_echo_create(uint16_t port);
