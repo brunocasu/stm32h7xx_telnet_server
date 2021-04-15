@@ -1,35 +1,38 @@
- /**
- * Copyright (c) 2001-2004 Swedish Institute of Computer Science.
- * All rights reserved. 
+ /*
+ * MIT License
  * 
- * Redistribution and use in source and binary forms, with or without modification, 
- * are permitted provided that the following conditions are met:
+ * Copyright (c) 2021 Bruno Augusto Casu
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ * 
+ * 
+ * This file is part of the lwIP based telnet server.
+ * 
+ * This project was inspired on (and may contain fragments of code from) the TCP 
+ * Echo Server example code provided by STMicroelectronics:
+ * 
+ *     github.com/STMicroelectronics/STM32CubeF4/commits/master/Projects/STM324xG_EVAL/
+ *     Applications/LwIP/LwIP_TCP_Echo_Server/Src/tcp_echoserver.c
  *
- * 1. Redistributions of source code must retain the above copyright notice,
- *    this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- * 3. The name of the author may not be used to endorse or promote products
- *    derived from this software without specific prior written permission. 
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED 
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF 
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT 
- * SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, 
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT 
- * OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN 
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING 
- * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY 
- * OF SUCH DAMAGE.
- *
- * This file is part of and a contribution to the lwIP TCP/IP stack.
- *
- * Credits go to Adam Dunkels (and the current maintainers) of this software.
- *
- * Christiaan Simons rewrote this file to get a more stable echo application.
- *
+ * 
+ * Contributor: André Muller Cascadan (2021 - SPRACE, São Paulo BR)
+ * 
  **/
 
 /* This file was modified by ST */
@@ -67,7 +70,7 @@ enum tcp_states
 struct tcp_mng_struct
 {
   uint8_t state;                        /* current connection state */
-  telnet_t* telnet_instance;              /* telnet instance identifier */
+  telnet_t* telnet_instance;            /* telnet instance identifier */
   UART_HandleTypeDef* serial_handler;   /* handler of the UART peripheral */
   struct pbuf *p;                       /* pointer on the received/to be transmitted pbuf */
   struct tcp_pcb *pcb;                  /* pointer on the current tcp_pcb */
@@ -103,35 +106,18 @@ void serial_to_tcp_Task (telnet_t *instance);
 
 void telnet_create( telnet_t* instance, uint16_t port, void (*receiver_callback)( uint8_t* buff, uint16_t len ) )
 {
-  //static uint8_t telnet_instance = 0;
-  //uint8_t *inst_for_task;
-  
-  // register the Custom UART callback for the recv mode
-  //HAL_UART_RegisterCallback(serial_handler, HAL_UART_RX_COMPLETE_CB_ID, telnet_serial_RxCpltCallback);
-
-
-
-	//inst_for_task = pvPortMalloc(sizeof(telnet_t));
-	//*inst_for_task = instance;
-
 
   // Stores the callback pointer
-	instance->receiver_callback = receiver_callback;
+  instance->receiver_callback = receiver_callback;
 
-  // create the serial recv task for this instance - pass the telnet instance to each new task created
+  // Create the serial recv task for this instance - pass the telnet instance to each new task created
   serial_to_tcp_TaskHandle = osThreadNew(serial_to_tcp_Task, (void *)instance, &serial_to_tcp_TaskAttributes);
 
-  // add the port of the TCP connection to the global array
+  // Stores the port of the TCP connection to the global array
   instance->tcp_port = port;
 
-  // add the handler of the serial peripheral to the global array
-  //instance->tcp_serial_handler = serial_handler;
-
-  // initialize new TCP connection for the given instance
+  // Initialize new TCP connection for the given instance
   telnet_init(instance);
-
-  // set counter for next instance
-  //telnet_instance++;
 
 }
 
@@ -210,7 +196,6 @@ static err_t tcp_com_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     es->state = ES_ACCEPTED; // update TCP state
     es->pcb = newpcb; // save connection pcb
     es->telnet_instance = instance; // save connection instance
-    //es->serial_handler = tcp_serial_handler[inst]; // save serial handler of this instance
     es->p = NULL;
     
     // pass newly allocated es structure as argument to newpcb
@@ -221,9 +206,6 @@ static err_t tcp_com_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     
     // initialize lwip tcp_err callback function for newpcb
     tcp_err(newpcb, tcp_com_error);
-    
-    // initialize serial peripheral in recv mode
-    //HAL_UART_Receive_IT(tcp_serial_handler[inst], &single_character, 1);
 
     ret_err = ERR_OK;
   }
@@ -533,41 +515,4 @@ void telnet_error_handler (uint8_t instance)
 }
 
 
-/**
- * @brief Callback function for Receiver Mode in the UDP Echo application
- *
- */
-static void udpecho_raw_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, struct ip_addr *addr, uint16_t port)
-{
-	if (p != NULL)
-	{
-		// Echo msg
-		udp_sendto(pcb, p, addr, port);
-		// Free Data Pointer
-		pbuf_free(p);
-	}
-}
-
-/**
- * @brief Extra application: create UDP Binding on a defined Port. Echoes all the messages sent in that port.
- * @param port Port number for the connection
- * @retval none
- *
- */
-void udp_echo_create(uint16_t port)
-{
-  struct udp_pcb * pcb;
-
-  // create new protocol control block for the UDP server
-  pcb = udp_new();
-
-  if (pcb != NULL)
-  {
-	// bing to the defined port
-  	udp_bind(pcb, IP_ADDR_ANY, port);
-  }
-
-  // Set UDP receiver with a callback function
-  udp_recv(pcb, udpecho_raw_recv, pcb);
-}
 
