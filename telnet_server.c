@@ -81,7 +81,7 @@ struct tcp_mng_struct
 static void telnet_init(telnet_t* instance);
 void telnet_error_handler (uint8_t instance);
 static void tcp_recv_reset(struct tcp_pcb *tpcb, struct tcp_mng_struct *es);
-static void tcp_pbuf_to_serial (struct pbuf* p, UART_HandleTypeDef* serial_handler, telnet_t* instance);
+static void process_incoming_bytes (struct pbuf* p, UART_HandleTypeDef* serial_handler, telnet_t* instance);
 
 
 // functions based in the TCP echosever example
@@ -104,11 +104,18 @@ void serial_to_tcp_Task (telnet_t *instance);
 
 
 
-void telnet_create( telnet_t* instance, uint16_t port, void (*receiver_callback)( uint8_t* buff, uint16_t len ) )
+void telnet_create( telnet_t* instance,
+                     uint16_t port,
+                         void (*receiver_callback)( uint8_t* buff, uint16_t len ),
+                         void (*command_callback) ( uint8_t* cmd,  uint16_t len )  )
 {
 
-  // Stores the callback pointer
+  // Stores the callback pointers
   instance->receiver_callback = receiver_callback;
+  instance->command_callback  = command_callback;
+
+  // Initializes command buffer size
+  instance->cmd_len = 0;
 
   // Create the serial recv task for this instance - pass the telnet instance to each new task created
   serial_to_tcp_TaskHandle = osThreadNew(serial_to_tcp_Task, (void *)instance, &serial_to_tcp_TaskAttributes);
@@ -254,7 +261,7 @@ static err_t tcp_com_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t
     }
     else // if there are still data to be sent
     {
-      tcp_pbuf_to_serial(p, es->serial_handler, es->telnet_instance);
+    	process_incoming_bytes(p, es->serial_handler, es->telnet_instance);
       
       // clear for new reception
       tcp_recv_reset(tpcb, es);
@@ -280,8 +287,8 @@ static err_t tcp_com_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t
     // store reference to incoming pbuf (chain)
     es->p = p;
 
-    // forward pkt data to serial interface
-    tcp_pbuf_to_serial(p, es->serial_handler, es->telnet_instance);
+    // forward pkt data to be processed
+    process_incoming_bytes(p, es->serial_handler, es->telnet_instance);
 
     // clear for new reception
     tcp_recv_reset(tpcb, es);
@@ -295,8 +302,8 @@ static err_t tcp_com_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t
     {
       es->p = p;
   
-      // forward pkt data to serial interface
-      tcp_pbuf_to_serial(p, es->serial_handler, es->telnet_instance);
+      // forward pkt data to be processed
+      process_incoming_bytes(p, es->serial_handler, es->telnet_instance);
 
       // clear for new reception
       tcp_recv_reset(tpcb, es);
@@ -421,17 +428,86 @@ static void tcp_com_connection_close(struct tcp_pcb *tpcb, struct tcp_mng_struct
 
 
 /**
- * @brief Send the received packet data (TCP) via serial port (UART)
+ * @brief Process the incoming bytes.
+ *
  * @param p TCP payload information struct
  * @param serial_handler STM32_HAL handler for the UART peripheral
- * @param telnet_instance instance value for this connection
- * @retval None
+ * @param instance Pointer to the server instance.
+ *
+ * This functions is responsible for filtering the telnet command from the
  * 
  * @note this function is called at the callback set in the tcp_recv() function
  */
-static void tcp_pbuf_to_serial (struct pbuf* p, UART_HandleTypeDef* serial_handler, telnet_t* instance)
+static void process_incoming_bytes (struct pbuf* p, UART_HandleTypeDef* serial_handler, telnet_t* instance)
 {
-    instance->receiver_callback( p->payload, p->len );
+    const uint8_t IAC  = 255; // See RFC 854 for details
+    const uint8_t WILL = 251;
+    const uint8_t DONT = 254;
+    //const uint8_t SB   = 254; TODO: Parse Subnegotiation commands.
+
+    uint8_t* pbuf_payload = p->payload;
+    uint16_t pbuf_len     = p->len;
+
+    /*
+     * If command callback IS NOT defined, all bytes are sent to the receiver callback.
+     *
+     * In this case user is responsible to separate them from characters.
+     */
+	if(instance->command_callback == NULL)
+	{
+		instance->receiver_callback( p->payload, p->len );
+	}
+
+	//If command callback IS defined, all bytes are filtered out from the characters
+	else
+	{
+		uint16_t char_offset   = 0;
+		uint16_t char_ctr      = 0;
+
+		for( int i = 0; i < pbuf_len; i++ )
+		{
+			// Counting characters: Command buffer is empty and IAC not found
+			if( (instance->cmd_len == 0) && (pbuf_payload[i] != IAC) )
+				++char_ctr;
+
+			// Counting command bytes
+			else
+			{
+				// Found IAC with command buffer empty:
+				if( (instance->cmd_len == 0) && (pbuf_payload[i] == IAC) )
+				{
+					// Process the characters found up to this point
+					if( char_ctr != 0 )
+						instance->receiver_callback( &pbuf_payload[char_offset], char_ctr );
+
+					instance->cmd_buff[instance->cmd_len] = pbuf_payload[i];
+					instance->cmd_len++;
+				}
+				else if( (instance->cmd_len == 1) && (pbuf_payload[i] >= WILL) && (pbuf_payload[i] <= DONT) )
+				{
+					instance->cmd_buff[instance->cmd_len] = pbuf_payload[i];
+					instance->cmd_len++;
+				}
+				else if( instance->cmd_len == 2 && (pbuf_payload[1] >= WILL) && (pbuf_payload[1] <= DONT) )
+				{
+					instance->cmd_buff[instance->cmd_len] = pbuf_payload[i];
+					instance->cmd_len++;
+
+					// Process the command
+					instance->command_callback( instance->cmd_buff,  instance->cmd_len);
+
+					// Restart counting characters. Erase command buffer.
+					instance->cmd_len = 0;
+					char_offset = i+1;
+					char_ctr = 0;
+				}
+			}
+		}
+
+		// Process the characters found at the end of buffer scanning
+		if( char_ctr != 0 )
+			instance->receiver_callback( &pbuf_payload[char_offset], char_ctr );
+	}
 }
 
 
@@ -449,7 +525,6 @@ void serial_to_tcp_Task (telnet_t *instance)
   static char serial_to_tcp_buff[512] = {0};
   static uint16_t msg_size = 0;
   int recv_ctr = 0;
-  uint8_t *ti;
   
   //ti = (uint8_t *)argument;
   //uint8_t const inst = *ti;
