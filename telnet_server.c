@@ -1,7 +1,7 @@
- /*
+/*
  * MIT License
  * 
- * Copyright (c) 2021 Bruno Augusto Casu
+ * Copyright (c) 2022 André Cascadan and Bruno Augusto Casu
  * 
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,438 +24,134 @@
  * 
  * This file is part of the lwIP based telnet server.
  * 
- * This project was inspired on (and may contain fragments of code from) the TCP 
- * Echo Server example code provided by STMicroelectronics:
- * 
- *     github.com/STMicroelectronics/STM32CubeF4/commits/master/Projects/STM324xG_EVAL/
- *     Applications/LwIP/LwIP_TCP_Echo_Server/Src/tcp_echoserver.c
- *
- * 
- * Contributor: André Muller Cascadan (2021 - SPRACE, São Paulo BR)
- * 
- **/
+ */
 
-/* This file was modified by ST */
-
-/* Modified by Bruno Casu (2021 - SPRACE, São Paulo BR) */
-/* This software provides a Serial over LAN implementation for the STM32H7 family */
-/* 1 TAB = 2 Spaces */
+/* 1 TAB = 4 Spaces */
 
 
 // FreeRTOS includes
 #include "cmsis_os.h"  // TODO: Decide which API to use: FreeRTOS or CMSIS. Here they are mixed.
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h"
 #include "stream_buffer.h"
-// LwIP includes
-//#include "lwip/debug.h"
-//#include "lwip/stats.h"
-#include "lwip/tcp.h"
 
+// LwIP includes
+#include "lwip/api.h"
 
 
 #include "telnet_server.h"
 
 
-enum tcp_states
-{
-  ES_NONE = 0,
-  ES_ACCEPTED,
-  ES_RECEIVED,
-  ES_CLOSING
-};
+// Current implementation allows only single telnet connection (one instance).
+static telnet_t telnet_instance;
+static telnet_t* instance = &telnet_instance;
 
+// Process input bytes
+static void process_incoming_bytes (uint8_t *data, int data_len, telnet_t* inst_ptr);
 
-// structure to maintain connection information, used as additional argument in LwIP callbacks
-struct tcp_mng_struct
-{
-  uint8_t state;                        /* current connection state */
-  telnet_t* telnet_instance;            /* telnet instance identifier */
-  UART_HandleTypeDef* serial_handler;   /* handler of the UART peripheral */
-  struct pbuf *p;                       /* pointer on the received/to be transmitted pbuf */
-  struct tcp_pcb *pcb;                  /* pointer on the current tcp_pcb */
-};
+// Callback for netconn interface
+static void netconn_cb (struct netconn *conn, enum netconn_evt evt, u16_t len);
 
-
-// functions created for the telnet implementation
-static void telnet_init(telnet_t* instance);
-void telnet_error_handler (uint8_t instance);
-static void tcp_recv_reset(struct tcp_pcb *tpcb, struct tcp_mng_struct *es);
-static void process_incoming_bytes (struct pbuf* p, UART_HandleTypeDef* serial_handler, telnet_t* instance);
-
-
-// functions based in the TCP echosever example
-static err_t tcp_com_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
-static err_t tcp_com_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
-static void tcp_com_error(void *arg, err_t err);
-static void tcp_com_connection_close(struct tcp_pcb *tpcb, struct tcp_mng_struct *es);
 
 
 // serial to TCP task handler and attributes
-osThreadId_t serial_to_tcp_TaskHandle;
+
 const osThreadAttr_t serial_to_tcp_TaskAttributes = {
   .name = "serial to tcp",
   .priority = (osPriority_t) osPriorityNormal,
   .stack_size = 256 * 8
 };
-// serial to TCP task function
-void serial_to_tcp_Task (telnet_t *instance);
+
+// Task functions
+static void wrt_task (void *arg);
+static void rcv_task (void *arg);
 
 
 
-
-void telnet_create( telnet_t* instance,
-                     uint16_t port,
-                         void (*receiver_callback)( uint8_t* buff, uint16_t len ),
-                         void (*command_callback) ( uint8_t* cmd,  uint16_t len )  )
+void telnet_create( uint16_t port,
+                    void (*receiver_callback)( uint8_t* buff, uint16_t len ),
+                    void (*command_callback) ( uint8_t* cmd,  uint16_t len )  )
 {
 
   // Stores the callback pointers
   instance->receiver_callback = receiver_callback;
   instance->command_callback  = command_callback;
 
+  err_t err;
+
   // Initializes command buffer size
   instance->cmd_len = 0;
-
-  // Create the serial recv task for this instance - pass the telnet instance to each new task created
-  serial_to_tcp_TaskHandle = osThreadNew(serial_to_tcp_Task, (void *)instance, &serial_to_tcp_TaskAttributes);
 
   // Stores the port of the TCP connection to the global array
   instance->tcp_port = port;
 
-  // Initialize new TCP connection for the given instance
-  telnet_init(instance);
+  // Starts local listening
+  instance->conn = netconn_new_with_callback(NETCONN_TCP, netconn_cb);
+  if( instance->conn == NULL )
+    return;
 
+  err = netconn_bind(instance->conn, NULL, port);
+  if ( err != ERR_OK )
+	return;
+
+  netconn_listen(instance->conn);
+
+  // No connection still established
+  instance->status = TELNET_CONN_STATUS_NONE;
+  
+  // Create the accept sentd task
+  instance->wrt_task_handle = osThreadNew(wrt_task, NULL, &serial_to_tcp_TaskAttributes);
+  instance->rcv_task_handle = osThreadNew(rcv_task, NULL, &serial_to_tcp_TaskAttributes);
 }
 
 
-/**
-  * @brief Initializes the TCP server
-  * @param telnet_inst number of the telnet instance
-  * @retval None
-  */
-static void telnet_init(telnet_t* instance)
-{
-  err_t err;
-  
-  // create new TCP protocol control block for the given instance - store the pcb in the global array
-  instance->telnet_pcb = tcp_new();
-  
-  if (instance->telnet_pcb != NULL)
-  {
-    // bind the TCP connection to defined port
-    err = tcp_bind(instance->telnet_pcb, IP_ADDR_ANY, instance->tcp_port);
-    
-    if (err == ERR_OK)
-    {
-      // start TCP listening
-      instance->telnet_pcb = tcp_listen(instance->telnet_pcb);
-      
-      // set tcp_accept callback function
-      tcp_accept(instance->telnet_pcb, tcp_com_accept);
-      tcp_arg(instance->telnet_pcb, (void*)instance);
-    }
-    
-    else 
-    {
-      // free the pcb if binding failed
-      memp_free(MEMP_TCP_PCB, instance->telnet_pcb);
-    }
-  }
-  else
-  {
-    // fail to create new protocol control block
-    telnet_error_handler (instance);
-  }
-}
-
-
-/**
-  * @brief  This function is the implementation of tcp_accept LwIP callback
-  * @param  arg not used
-  * @param  newpcb pointer on tcp_pcb struct for the newly created TCP connection
-  * @param  err not used
-  * @retval err_t error status
-  * 
-  * @note This callback is called upon a request from the remote host. It will set receiver mode for
-  *       the TCP server and also for the UART peripheral of the defined instance.
-  */
-static err_t tcp_com_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
-{
-  err_t ret_err;
-  struct tcp_mng_struct *es;
-  //int inst_located = 0;
-  telnet_t* instance = (telnet_t*)arg;
-
-  //LWIP_UNUSED_ARG(arg);
-  LWIP_UNUSED_ARG(err);
-
-  // set priority for the newly accepted TCP connection newpcb
-  tcp_setprio(newpcb, TCP_PRIO_MIN);
-  
-  // save pcb data for transmission
-  instance->host_pcb = (struct tcp_pcb *)newpcb;
-
-  // allocate the TCP control structure to maintain connection informations
-  es = (struct tcp_mng_struct *)mem_malloc(sizeof(struct tcp_mng_struct));
-  if (es != NULL)
-  {
-    es->state = ES_ACCEPTED; // update TCP state
-    es->pcb = newpcb; // save connection pcb
-    es->telnet_instance = instance; // save connection instance
-    es->p = NULL;
-    
-    // pass newly allocated es structure as argument to newpcb
-    tcp_arg(newpcb, es);
-    
-    // initialize lwip tcp_recv callback function for newpcb
-    tcp_recv(newpcb, tcp_com_recv);
-    
-    // initialize lwip tcp_err callback function for newpcb
-    tcp_err(newpcb, tcp_com_error);
-
-    ret_err = ERR_OK;
-  }
-  else
-  {
-    // close TCP connection
-    tcp_com_connection_close(newpcb, es);
-
-    // return memory error
-    ret_err = ERR_MEM;
-  }
-  return ret_err;  
-}
-
-
-/**
-  * @brief  This function is the implementation for tcp_recv LwIP callback
-  * @param  arg pointer on a argument for the tcp_pcb connection - used for the TCP control struct
-  * @param  tpcb pointer on the tcp_pcb connection
-  * @param  pbuf pointer on the received pbuf
-  * @param  err error information regarding the received pbuf
-  * @retval err_t error code
-  * 
-  * @note As the TCP connection is accepted, this callback will be called upon the receiving of a TCP pkt.
-  *       It will identify the instance of the telnet connection based on the TCP port that received the pkt.
-  *       After confirming the instance it will transmit the data obtained from the TCP pkt using the defined serial port.
-  */
-static err_t tcp_com_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
-{
-  struct tcp_mng_struct *es;
-  err_t ret_err;
-
-  LWIP_ASSERT("arg != NULL",arg != NULL);
-  
-  es = (struct tcp_mng_struct *)arg;
-  
-  // if we receive an empty tcp frame from client => close connection
-  if (p == NULL)
-  {
-    // remote host closed connection
-    es->state = ES_CLOSING;
-    if(es->p == NULL)
-    {
-       // we're done sending, close connection
-       tcp_com_connection_close(tpcb, es);
-    }
-    else // if there are still data to be sent
-    {
-    	process_incoming_bytes(p, es->serial_handler, es->telnet_instance);
-      
-      // clear for new reception
-      tcp_recv_reset(tpcb, es);
-    }
-    ret_err = ERR_OK;
-  }   
-  // else: a non empty frame was received from client but for some reason err != ERR_OK
-  else if(err != ERR_OK)
-  {
-    // free received pbuf
-    if (p != NULL)
-    {
-      es->p = NULL;
-      pbuf_free(p);
-    }
-    ret_err = err;
-  }
-  else if(es->state == ES_ACCEPTED)
-  {
-    // first data chunk in p->payload
-    es->state = ES_RECEIVED;
-    
-    // store reference to incoming pbuf (chain)
-    es->p = p;
-
-    // forward pkt data to be processed
-    process_incoming_bytes(p, es->serial_handler, es->telnet_instance);
-
-    // clear for new reception
-    tcp_recv_reset(tpcb, es);
-
-    ret_err = ERR_OK;
-  }
-  else if(es->state == ES_RECEIVED)
-  {
-    // more data received from client and previous data has been already sent
-    if(es->p == NULL)
-    {
-      es->p = p;
-  
-      // forward pkt data to be processed
-      process_incoming_bytes(p, es->serial_handler, es->telnet_instance);
-
-      // clear for new reception
-      tcp_recv_reset(tpcb, es);
-    }
-    else
-    {
-      struct pbuf *ptr;
-
-      // chain pbufs to the end of what we received previously
-      ptr = es->p;
-      pbuf_chain(ptr,p);
-
-    }
-    ret_err = ERR_OK;
-  }
-  else if(es->state == ES_CLOSING)
-  {
-    // odd case, remote side closing twice, trash data
-    tcp_recved(tpcb, p->tot_len);
-    es->p = NULL;
-    pbuf_free(p);
-    ret_err = ERR_OK;
-  }
-  else
-  {
-    // unknown es->state, trash data
-    tcp_recved(tpcb, p->tot_len);
-    es->p = NULL;
-    pbuf_free(p);
-    ret_err = ERR_OK;
-  }
-  return ret_err;
-}
-
-
-/**
-  * @brief  This function implements the tcp_err callback function (called
-  *         when a fatal tcp_connection error occurs. 
-  * @param  arg pointer on argument parameter
-  * @param  err not used
-  * @retval None
-  */
-static void tcp_com_error(void *arg, err_t err)
-{
-  struct tcp_mng_struct *es;
-
-  LWIP_UNUSED_ARG(err);
-
-  es = (struct tcp_mng_struct *)arg;
-  if (es != NULL)
-  {
-    //  free es structure
-    mem_free(es);
-  }
-}
-
-
-/**
- * @brief Clear tcp struct to enable new reception
- * @param tpcb pointer on the tcp_pcb connection
- * @param es TCP control struct
- * @retval none
+/*
+ * Netconn callback
  *
+ * This project uses netconn with callback to manage the open/close events
  */
-static void tcp_recv_reset(struct tcp_pcb *tpcb, struct tcp_mng_struct *es)
+void netconn_cb (struct netconn *conn, enum netconn_evt evt, u16_t len)
 {
-  struct pbuf *ptr;
-  
-  // get pointer on pbuf from es structure
-  ptr = es->p;
-  
-  uint16_t plen;
-  uint8_t freed;
-  
-  plen = ptr->len;
-  
-  // continue with next pbuf in chain (if any)
-  es->p = ptr->next;
-  
-  if(es->p != NULL)
-  {
-    // increment reference count for es->p
-    pbuf_ref(es->p);
-  }
-  
-  // chop first pbuf from chain
-  do
-  {
-    // try hard to free pbuf
-    freed = pbuf_free(ptr);
-  }
-  while(freed == 0);
-  // we can read more data now
-  tcp_recved(tpcb, plen);
+	if( evt == NETCONN_EVT_RCVPLUS )
+	{
+		if( len == 0 ) // len = 0 means the connections is being opened or closed by the client
+		{
+			// Switch the connection status according to the current one
+			if( instance->status == TELNET_CONN_STATUS_ACCEPTING)
+				instance->status = TELNET_CONN_STATUS_CONNECTED;
+			else
+				instance->status = TELNET_CONN_STATUS_CLOSING;
+		}
+	}
 }
 
 
-/**
-  * @brief  This functions closes the tcp connection
-  * @param  tcp_pcb pointer on the tcp connection
-  * @param  es pointer on echo_state structure
-  * @retval None
-  */
-static void tcp_com_connection_close(struct tcp_pcb *tpcb, struct tcp_mng_struct *es)
-{
-  // remove all callbacks
-  tcp_arg(tpcb, NULL);
-  tcp_sent(tpcb, NULL);
-  tcp_recv(tpcb, NULL);
-  tcp_err(tpcb, NULL);
-  tcp_poll(tpcb, NULL, 0);
-  
-  // delete es structure
-  if (es != NULL)
-  {
-    mem_free(es);
-  }  
 
-  // close tcp connection
-  tcp_close(tpcb);
-}
-
-
-/**
- * @brief Process the incoming bytes.
+/*
+ * Process input bytes
  *
- * @param p TCP payload information struct
- * @param serial_handler STM32_HAL handler for the UART peripheral
- * @param instance Pointer to the server instance.
- *
- * This functions is responsible for filtering the telnet command from the
- * 
- * @note this function is called at the callback set in the tcp_recv() function
+ * Filters out the telnet commands from the regular characters and calls the
+ * proper user callback.
  */
-static void process_incoming_bytes (struct pbuf* p, UART_HandleTypeDef* serial_handler, telnet_t* instance)
+static void process_incoming_bytes (uint8_t *data, int data_len, telnet_t* inst_ptr)
 {
     const uint8_t IAC  = 255; // See RFC 854 for details
     const uint8_t WILL = 251;
     const uint8_t DONT = 254;
     //const uint8_t SB   = 254; TODO: Parse Subnegotiation commands.
 
-    uint8_t* pbuf_payload = p->payload;
-    uint16_t pbuf_len     = p->len;
+    uint8_t* pbuf_payload = data;
+    uint16_t pbuf_len     = data_len;
 
     /*
      * If command callback IS NOT defined, all bytes are sent to the receiver callback.
      *
      * In this case user is responsible to separate them from characters.
      */
-	if(instance->command_callback == NULL)
+	if(inst_ptr->command_callback == NULL)
 	{
-		instance->receiver_callback( p->payload, p->len );
+		inst_ptr->receiver_callback( pbuf_payload, pbuf_len );
 	}
 
 	//If command callback IS defined, all bytes are filtered out from the characters
@@ -467,37 +163,37 @@ static void process_incoming_bytes (struct pbuf* p, UART_HandleTypeDef* serial_h
 		for( int i = 0; i < pbuf_len; i++ )
 		{
 			// Counting characters: Command buffer is empty and IAC not found
-			if( (instance->cmd_len == 0) && (pbuf_payload[i] != IAC) )
+			if( (inst_ptr->cmd_len == 0) && (pbuf_payload[i] != IAC) )
 				++char_ctr;
 
 			// Counting command bytes
 			else
 			{
 				// Found IAC with command buffer empty:
-				if( (instance->cmd_len == 0) && (pbuf_payload[i] == IAC) )
+				if( (inst_ptr->cmd_len == 0) && (pbuf_payload[i] == IAC) )
 				{
 					// Process the characters found up to this point
 					if( char_ctr != 0 )
-						instance->receiver_callback( &pbuf_payload[char_offset], char_ctr );
+						inst_ptr->receiver_callback( &pbuf_payload[char_offset], char_ctr );
 
-					instance->cmd_buff[instance->cmd_len] = pbuf_payload[i];
-					instance->cmd_len++;
+					inst_ptr->cmd_buff[inst_ptr->cmd_len] = pbuf_payload[i];
+					inst_ptr->cmd_len++;
 				}
-				else if( (instance->cmd_len == 1) && (pbuf_payload[i] >= WILL) && (pbuf_payload[i] <= DONT) )
+				else if( (inst_ptr->cmd_len == 1) && (pbuf_payload[i] >= WILL) && (pbuf_payload[i] <= DONT) )
 				{
-					instance->cmd_buff[instance->cmd_len] = pbuf_payload[i];
-					instance->cmd_len++;
+					inst_ptr->cmd_buff[inst_ptr->cmd_len] = pbuf_payload[i];
+					inst_ptr->cmd_len++;
 				}
-				else if( instance->cmd_len == 2 && (pbuf_payload[1] >= WILL) && (pbuf_payload[1] <= DONT) )
+				else if( inst_ptr->cmd_len == 2 && (pbuf_payload[1] >= WILL) && (pbuf_payload[1] <= DONT) )
 				{
-					instance->cmd_buff[instance->cmd_len] = pbuf_payload[i];
-					instance->cmd_len++;
+					inst_ptr->cmd_buff[inst_ptr->cmd_len] = pbuf_payload[i];
+					inst_ptr->cmd_len++;
 
 					// Process the command
-					instance->command_callback( instance->cmd_buff,  instance->cmd_len);
+					inst_ptr->command_callback( inst_ptr->cmd_buff,  inst_ptr->cmd_len);
 
 					// Restart counting characters. Erase command buffer.
-					instance->cmd_len = 0;
+					inst_ptr->cmd_len = 0;
 					char_offset = i+1;
 					char_ctr = 0;
 				}
@@ -506,88 +202,142 @@ static void process_incoming_bytes (struct pbuf* p, UART_HandleTypeDef* serial_h
 
 		// Process the characters found at the end of buffer scanning
 		if( char_ctr != 0 )
-			instance->receiver_callback( &pbuf_payload[char_offset], char_ctr );
+			inst_ptr->receiver_callback( &pbuf_payload[char_offset], char_ctr );
 	}
 }
 
 
+
+
 /**
- * @brief Telnet task to transmit data from the serial port to the TCP host connected
- * @param argument used to identify the telnet instance for the multiple tasks created
+ * @brief Telnet task to transmit data from the stream port to the TCP host connected
+ * @param arg (not used used)
  * @retval None
  *
  */
-void serial_to_tcp_Task (telnet_t *instance)
+static void wrt_task (void *arg)
 {
-  unsigned char c;
-  const TickType_t xBlockTime = pdMS_TO_TICKS( 20 ); // timeout to send the tcp message
-  size_t xReceivedBytes; // control to identify end of msg
-  static char serial_to_tcp_buff[512] = {0};
-  static uint16_t msg_size = 0;
-  int recv_ctr = 0;
-  
-  //ti = (uint8_t *)argument;
-  //uint8_t const inst = *ti;
 
-  // create the stream buffer to receive single character from the ISR (UART custom callback)
+  const TickType_t xBlockTime = pdMS_TO_TICKS( 20 ); // timeout to send the tcp message
+
+  //TX
+  static char tx_buff[512];
+  const int tx_buff_size = 512;
+  int n_from_stream;
+  
+  //RX
+  struct netbuf *rx_netbuf;
+  void *rx_data;
+  u16_t rx_data_len;
+  err_t recv_err;
+
+  err_t accept_err;
+
+
+
+  // create the stream buffer to receive characters from the stream
   instance->serial_input_stream = xStreamBufferCreate(256, 1);
 
+
+
+  /*
+   * Accept loop
+   * Stays waiting for a connection. If connection breaks, it waits for a new one.
+   */
   for(;;)
   {
-    if (recv_ctr == 0) // start receiver without a timeout value: waiting for a new char from the serial
-    {
-      xReceivedBytes = xStreamBufferReceive(instance->serial_input_stream, &c, 1, portMAX_DELAY);
-      recv_ctr = 1;
-    }
-    else if (recv_ctr == 1) // after receiving the first character, the buffer reading has a timeout
-    {
-      xReceivedBytes = xStreamBufferReceive(instance->serial_input_stream, &c, 1, xBlockTime); // return zero if timeout occurs: no data in the buffer
-    }                                                                                                                       
-    
-    // add received char to buff (if any), increment msg size counter
-    if (xReceivedBytes > 0)
-    {
-      serial_to_tcp_buff[msg_size] = c;
-      msg_size++;
-    }
-    
-    // check for the end of the msg: no chars received in the timeout period or buff max size reached
-    if ( (xReceivedBytes == 0) || (msg_size >= (sizeof(serial_to_tcp_buff) -1)) )
-    {
-      // enqueue data for transmission - max size of TCP data sent is 512 Bytes
-      tcp_write(instance->host_pcb, serial_to_tcp_buff, msg_size, TCP_WRITE_FLAG_COPY);
-      // output the TCP data
-      tcp_output(instance->host_pcb);
-      // reset msg size and return to receiver without timeout
-      msg_size = 0;
-      recv_ctr = 0;
-    }
+	  instance->status = TELNET_CONN_STATUS_ACCEPTING;
+	  accept_err = netconn_accept(instance->conn, &instance->newconn);
+	  //netconn_set_recvtimeout ( newconn, 100 );
+	  if( accept_err == ERR_OK )
+	  {
+		  // Transfer loop
+		  for(;;)
+		  {
+			  n_from_stream = xStreamBufferReceive(instance->serial_input_stream, tx_buff, tx_buff_size, xBlockTime);
+
+			  // Check the connections status before send bytes, if any
+			  if( n_from_stream != 0 && instance->status == TELNET_CONN_STATUS_CONNECTED )
+				  netconn_write(instance->newconn, tx_buff, n_from_stream, NETCONN_COPY);
+
+			  // Iteratively reads all the available data
+			  //recv_err = netconn_recv(newconn, &rx_netbuf);
+			  //if ( recv_err == ERR_OK)
+			  //{
+			//	  netbuf_data(rx_netbuf, &rx_data, &rx_data_len);
+			//	  process_incoming_bytes (rx_data, rx_data_len, instance);
+              //
+              //
+			  //    netbuf_delete(rx_netbuf);
+			  //}
+
+			  // Force a connections close if a terminating was detected from client
+			  if( instance->status == TELNET_CONN_STATUS_CLOSING )
+				  break;
+
+		  }
+
+		  netconn_close (instance->newconn);
+		  netconn_delete(instance->newconn);
+	  }
   }
 }
 
+static void rcv_task (void *arg)
+{
+	struct netbuf *rx_netbuf;
+	void *rx_data;
+	uint16_t rx_data_len;
+	err_t recv_err;
 
-uint16_t telnet_transmit(telnet_t* instance, uint8_t* buff, uint16_t len)
+	for(;;)
+	{
+
+		if( instance->status != TELNET_CONN_STATUS_CONNECTED )
+		{
+			vTaskDelay(100); // *do nothing* delay if there is no connection.
+		}
+		else
+		{
+			// Iteratively reads all the available data
+			recv_err = netconn_recv(instance->newconn, &rx_netbuf);
+			if ( recv_err == ERR_OK)
+			{
+				// Navigate trough netbuffs until dump all data
+				do
+				{
+					netbuf_data(rx_netbuf, &rx_data, &rx_data_len);
+					process_incoming_bytes (rx_data, rx_data_len, instance);
+
+				}while(  netbuf_next(rx_netbuf) >= 0 );
+
+				netbuf_delete( rx_netbuf );
+			}
+		}
+	}
+}
+
+
+
+uint16_t telnet_transmit(uint8_t* buff, uint16_t len)
 {
   //TODO: flexibility for ISR context
+  int ret;
 
   if( instance->serial_input_stream == NULL )
 	  return 0;
   
+  if( instance->status != TELNET_CONN_STATUS_CONNECTED )
+	  return 0;
+
   // Send char to stream buffer of the associated instance
-  return xStreamBufferSend(instance->serial_input_stream, buff, len, 0);
+  //taskENTER_CRITICAL();
+  ret = xStreamBufferSend(instance->serial_input_stream, buff, len, 100);
+  //taskEXIT_CRITICAL();
+
+  return ret;
 }
 
-
-/**
- * @brief Error handler function
- * @param instance telnet instance
- * @retval None
- * 
- */
-void telnet_error_handler (uint8_t instance)
-{
-  while(1);
-}
 
 
 

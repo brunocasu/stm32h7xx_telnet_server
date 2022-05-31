@@ -1,7 +1,7 @@
 /*
  * MIT License
  * 
- * Copyright (c) 2021 Bruno Augusto Casu
+ * Copyright (c) 2022 André Cascadan and Bruno Augusto Casu
  * 
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,12 +23,10 @@
  * 
  * 
  * This file is part of the lwIP based telnet server.
- * 
- * Contributor: André Muller Cascadan (2021 - SPRACE, São Paulo BR)
  *
  */
 
-/* 1 TAB = 2 Spaces */
+/* 1 TAB = 4 Spaces */
 
 #ifndef __TELNET_H__
 #define __TELNET_H__
@@ -38,12 +36,16 @@
 #include "stream_buffer.h"
 
 // LwIP includes
-#include "lwip/tcp.h"
+#include "lwip/api.h"
 
 
 
 typedef struct
 {
+	osThreadId_t wrt_task_handle;
+	osThreadId_t rcv_task_handle;
+
+
   struct tcp_pcb* telnet_pcb;   // Stores TCP connection instances
   struct tcp_pcb* host_pcb;
   uint16_t tcp_port;            // Port do be listened in this telnet connection
@@ -52,6 +54,18 @@ typedef struct
   void (*command_callback) ( uint8_t* cmd,  uint16_t len );
   uint8_t cmd_buff[10];
   uint16_t cmd_len;
+
+  struct netconn *conn;
+  struct netconn *newconn;
+
+  enum
+  {
+	  TELNET_CONN_STATUS_NONE = 0,
+	  TELNET_CONN_STATUS_ACCEPTING,
+	  TELNET_CONN_STATUS_CONNECTED,
+	  TELNET_CONN_STATUS_CLOSING
+  } status;
+
 
 } telnet_t;
 
@@ -67,10 +81,9 @@ typedef struct
  *                           In this case, user is responsible to filter commands form
  *                           characters.
  */
-void telnet_create( telnet_t* instance,
-                     uint16_t port,
-                         void (*receiver_callback)( uint8_t* buff, uint16_t len ),
-                         void (*command_callback) ( uint8_t* cmd,  uint16_t len )  );
+void telnet_create( uint16_t port,
+                    void (*receiver_callback)( uint8_t* buff, uint16_t len ),
+                    void (*command_callback) ( uint8_t* cmd,  uint16_t len )  );
 
 
 /*
@@ -80,7 +93,7 @@ void telnet_create( telnet_t* instance,
  *
  * This functions can be user to send characters or telnet commands.
  */
-uint16_t telnet_transmit(telnet_t* instance, uint8_t* buff, uint16_t len);
+uint16_t telnet_transmit(uint8_t* buff, uint16_t len);
 
 
 // When using LwIP Middleware:
