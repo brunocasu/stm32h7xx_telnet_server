@@ -39,32 +39,38 @@
 #include "lwip/api.h"
 
 
+#define TELNET_BUFF_SIZE 1024
+
 
 typedef struct
 {
+	// Port do be listened in this telnet connection
+	uint16_t tcp_port;
+
+	void (*receiver_callback)( uint8_t* buff, uint16_t len );
+	void (*command_callback) ( uint8_t* cmd,  uint16_t len );
+
 	osThreadId_t wrt_task_handle;
 	osThreadId_t rcv_task_handle;
 
+	// Output buffer
+	uint8_t*          buff;
+	SemaphoreHandle_t buff_mutex;
+	uint16_t          buff_count;
 
-  struct tcp_pcb* telnet_pcb;   // Stores TCP connection instances
-  struct tcp_pcb* host_pcb;
-  uint16_t tcp_port;            // Port do be listened in this telnet connection
-  StreamBufferHandle_t serial_input_stream;
-  void (*receiver_callback)( uint8_t* buff, uint16_t len );
-  void (*command_callback) ( uint8_t* cmd,  uint16_t len );
-  uint8_t cmd_buff[10];
-  uint16_t cmd_len;
+	uint8_t cmd_buff[10];
+	uint16_t cmd_len;
 
-  struct netconn *conn;
-  struct netconn *newconn;
+	struct netconn *conn;
+	struct netconn *newconn;
 
-  enum
-  {
-	  TELNET_CONN_STATUS_NONE = 0,
-	  TELNET_CONN_STATUS_ACCEPTING,
-	  TELNET_CONN_STATUS_CONNECTED,
-	  TELNET_CONN_STATUS_CLOSING
-  } status;
+	enum
+	{
+		 TELNET_CONN_STATUS_NONE = 0,
+		 TELNET_CONN_STATUS_ACCEPTING,
+		 TELNET_CONN_STATUS_CONNECTED,
+		 TELNET_CONN_STATUS_CLOSING
+	} status;
 
 
 } telnet_t;
@@ -86,18 +92,15 @@ void telnet_create( uint16_t port,
                     void (*command_callback) ( uint8_t* cmd,  uint16_t len )  );
 
 
-/*
+/**
  * @brief Sends data  to the client.
  * 
  * returns: the amount of bytes actually received by the driver.
  *
  * This functions can be user to send characters or telnet commands.
  */
-uint16_t telnet_transmit(uint8_t* buff, uint16_t len);
+uint16_t telnet_transmit(uint8_t* data, uint16_t len);
 
 
-// When using LwIP Middleware:
-// To enable Hostname go to /LwIP/src/include/lwip/opt.h and change the value of LWIP_NETIF_HOSTNAME to 1
-// To edit Hostname go to /LWIP/Target/ethernetif.c and search for LWIP_NETIF_HOSTNAME
 
 #endif /* __TELNET_H__ */

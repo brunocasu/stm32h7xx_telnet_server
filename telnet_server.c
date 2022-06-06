@@ -47,6 +47,14 @@
 static telnet_t telnet_instance;
 static telnet_t* instance = &telnet_instance;
 
+/*
+ *  Period of TX buffer polling = 10ms
+ *
+ *  This parameter combined with a buffer size of 1024 bytes
+ *  will result in an average throughput of 100 KBytes per second.
+ */
+static const TickType_t tx_cycle_period = pdMS_TO_TICKS( 10 );
+
 // Process input bytes
 static void process_incoming_bytes (uint8_t *data, int data_len, telnet_t* inst_ptr);
 
@@ -55,12 +63,18 @@ static void netconn_cb (struct netconn *conn, enum netconn_evt evt, u16_t len);
 
 
 
-// serial to TCP task handler and attributes
+// Task and attributes
 
-const osThreadAttr_t serial_to_tcp_TaskAttributes = {
-  .name = "serial to tcp",
+const osThreadAttr_t wrt_task_attributes = {
+  .name = "TelnetWrtTask",
   .priority = (osPriority_t) osPriorityNormal,
-  .stack_size = 256 * 8
+  .stack_size = 256 * 4
+};
+
+const osThreadAttr_t rcv_task_attributes = {
+  .name = "TelnetRcvTask",
+  .priority = (osPriority_t) osPriorityNormal,
+  .stack_size = 128 * 4
 };
 
 // Task functions
@@ -74,36 +88,37 @@ void telnet_create( uint16_t port,
                     void (*command_callback) ( uint8_t* cmd,  uint16_t len )  )
 {
 
-  // Stores the callback pointers
-  instance->receiver_callback = receiver_callback;
-  instance->command_callback  = command_callback;
+	err_t err;
 
-  err_t err;
+	// Stores the callback pointers
+	instance->receiver_callback = receiver_callback;
+	instance->command_callback  = command_callback;
 
-  // Initializes command buffer size
-  instance->cmd_len = 0;
+	// Initializes command buffer size
+	instance->cmd_len = 0;
 
-  // Stores the port of the TCP connection to the global array
-  instance->tcp_port = port;
+	// Stores the port of the TCP connection to the global array
+	instance->tcp_port = port;
 
-  // Starts local listening
-  instance->conn = netconn_new_with_callback(NETCONN_TCP, netconn_cb);
-  if( instance->conn == NULL )
-    return;
+	// Starts local listening
+	instance->conn = netconn_new_with_callback(NETCONN_TCP, netconn_cb);
+	if( instance->conn == NULL )
+		return;
 
-  err = netconn_bind(instance->conn, NULL, port);
-  if ( err != ERR_OK )
-	return;
+	err = netconn_bind(instance->conn, NULL, port);
+	if ( err != ERR_OK )
+		return;
 
-  netconn_listen(instance->conn);
+	netconn_listen(instance->conn);
 
-  // No connection still established
-  instance->status = TELNET_CONN_STATUS_NONE;
-  
-  // Create the accept sentd task
-  instance->wrt_task_handle = osThreadNew(wrt_task, NULL, &serial_to_tcp_TaskAttributes);
-  instance->rcv_task_handle = osThreadNew(rcv_task, NULL, &serial_to_tcp_TaskAttributes);
+	// No connection still established
+	instance->status = TELNET_CONN_STATUS_NONE;
+
+	// Create the accept sentd task
+	instance->wrt_task_handle = osThreadNew(wrt_task, NULL, &wrt_task_attributes);
+	instance->rcv_task_handle = osThreadNew(rcv_task, NULL, &rcv_task_attributes);
 }
+
 
 
 /*
@@ -126,6 +141,145 @@ void netconn_cb (struct netconn *conn, enum netconn_evt evt, u16_t len)
 	}
 }
 
+
+
+/*
+ * TX task ()
+ *
+ * This task waits for bytes to be transmitted to the client.
+ *
+ * Connection/disconnection is also managed by this task.
+ *
+ */
+static void wrt_task (void *arg)
+{
+
+  err_t accept_err;
+
+  // create the buffer to accumulate bytes to be sent
+  instance->buff       = ( uint8_t*) pvPortMalloc( sizeof(uint8_t)*TELNET_BUFF_SIZE );
+  instance->buff_mutex = xSemaphoreCreateMutex();
+  instance->buff_count = 0;
+
+  /*
+   * Accept loop
+   * Stays waiting for a connection. If connection breaks, it waits for a new one.
+   */
+  for(;;)
+  {
+	  instance->status = TELNET_CONN_STATUS_ACCEPTING;
+	  accept_err = netconn_accept(instance->conn, &instance->newconn);
+	  if( accept_err == ERR_OK )
+	  {
+		  // Transfer loop
+		  for(;;)
+		  {
+			  vTaskDelay( tx_cycle_period );
+
+			  xSemaphoreTake( instance->buff_mutex, portMAX_DELAY );
+
+			  // Check the connections status before send bytes, if any
+			  if( instance->status == TELNET_CONN_STATUS_CONNECTED && instance->buff_count > 0 )
+				  netconn_write(instance->newconn, instance->buff, instance->buff_count, NETCONN_COPY);
+
+			  instance->buff_count = 0;
+
+			  xSemaphoreGive( instance->buff_mutex );
+
+			  // Force a connections close if a terminating was detected from client
+			  if( instance->status == TELNET_CONN_STATUS_CLOSING )
+				  break;
+
+		  }
+
+		  netconn_close (instance->newconn);
+		  netconn_delete(instance->newconn);
+	  }
+  }
+}
+
+
+
+/*
+ * TX task ()
+ *
+ * This task waits for input bytes from the client.
+ */
+static void rcv_task (void *arg)
+{
+	struct netbuf *rx_netbuf;
+	void *rx_data;
+	uint16_t rx_data_len;
+	err_t recv_err;
+
+	for(;;)
+	{
+
+		if( instance->status != TELNET_CONN_STATUS_CONNECTED )
+		{
+			vTaskDelay(100); // *do nothing* delay if there is no connection.
+		}
+		else
+		{
+			// Iteratively reads all the available data
+			recv_err = netconn_recv(instance->newconn, &rx_netbuf);
+			if ( recv_err == ERR_OK)
+			{
+				// Navigate trough netbuffs until dump all data
+				do
+				{
+					netbuf_data(rx_netbuf, &rx_data, &rx_data_len);
+					process_incoming_bytes (rx_data, rx_data_len, instance);
+
+				}while(  netbuf_next(rx_netbuf) >= 0 );
+
+				netbuf_delete( rx_netbuf );
+			}
+		}
+	}
+}
+
+
+
+/*
+ * Transmit bytes
+ *
+ * This functions is called by the user to send bytes to client.
+ *
+ * Telnet command bytes can also be sent via this functions.
+ */
+uint16_t telnet_transmit(uint8_t* data, uint16_t len)
+{
+  //TODO: Feature: add flexibility for ISR context
+
+	int sent = 0;
+
+	if( instance->buff_mutex == NULL )
+		return 0;
+  
+	if( instance->status != TELNET_CONN_STATUS_CONNECTED )
+		return 0;
+
+  // Iterates until all bytes is fed to the buffer
+  do
+  {
+	  xSemaphoreTake( instance->buff_mutex, portMAX_DELAY );
+	  while( (len > 0) && (instance->buff_count < TELNET_BUFF_SIZE) )
+	  {
+		  instance->buff[instance->buff_count] = data[sent];
+		  ++instance->buff_count;
+		  ++sent;
+		  --len;
+	  }
+	  xSemaphoreGive( instance->buff_mutex );
+
+	  if(len > 0)
+		  vTaskDelay( tx_cycle_period ); // Wait for one TX cycle before going to next iteration
+
+  } while(len > 0);
+
+  return sent;
+}
 
 
 /*
@@ -205,139 +359,4 @@ static void process_incoming_bytes (uint8_t *data, int data_len, telnet_t* inst_
 			inst_ptr->receiver_callback( &pbuf_payload[char_offset], char_ctr );
 	}
 }
-
-
-
-
-/**
- * @brief Telnet task to transmit data from the stream port to the TCP host connected
- * @param arg (not used used)
- * @retval None
- *
- */
-static void wrt_task (void *arg)
-{
-
-  const TickType_t xBlockTime = pdMS_TO_TICKS( 20 ); // timeout to send the tcp message
-
-  //TX
-  static char tx_buff[512];
-  const int tx_buff_size = 512;
-  int n_from_stream;
-  
-  //RX
-  struct netbuf *rx_netbuf;
-  void *rx_data;
-  u16_t rx_data_len;
-  err_t recv_err;
-
-  err_t accept_err;
-
-
-
-  // create the stream buffer to receive characters from the stream
-  instance->serial_input_stream = xStreamBufferCreate(256, 1);
-
-
-
-  /*
-   * Accept loop
-   * Stays waiting for a connection. If connection breaks, it waits for a new one.
-   */
-  for(;;)
-  {
-	  instance->status = TELNET_CONN_STATUS_ACCEPTING;
-	  accept_err = netconn_accept(instance->conn, &instance->newconn);
-	  //netconn_set_recvtimeout ( newconn, 100 );
-	  if( accept_err == ERR_OK )
-	  {
-		  // Transfer loop
-		  for(;;)
-		  {
-			  n_from_stream = xStreamBufferReceive(instance->serial_input_stream, tx_buff, tx_buff_size, xBlockTime);
-
-			  // Check the connections status before send bytes, if any
-			  if( n_from_stream != 0 && instance->status == TELNET_CONN_STATUS_CONNECTED )
-				  netconn_write(instance->newconn, tx_buff, n_from_stream, NETCONN_COPY);
-
-			  // Iteratively reads all the available data
-			  //recv_err = netconn_recv(newconn, &rx_netbuf);
-			  //if ( recv_err == ERR_OK)
-			  //{
-			//	  netbuf_data(rx_netbuf, &rx_data, &rx_data_len);
-			//	  process_incoming_bytes (rx_data, rx_data_len, instance);
-              //
-              //
-			  //    netbuf_delete(rx_netbuf);
-			  //}
-
-			  // Force a connections close if a terminating was detected from client
-			  if( instance->status == TELNET_CONN_STATUS_CLOSING )
-				  break;
-
-		  }
-
-		  netconn_close (instance->newconn);
-		  netconn_delete(instance->newconn);
-	  }
-  }
-}
-
-static void rcv_task (void *arg)
-{
-	struct netbuf *rx_netbuf;
-	void *rx_data;
-	uint16_t rx_data_len;
-	err_t recv_err;
-
-	for(;;)
-	{
-
-		if( instance->status != TELNET_CONN_STATUS_CONNECTED )
-		{
-			vTaskDelay(100); // *do nothing* delay if there is no connection.
-		}
-		else
-		{
-			// Iteratively reads all the available data
-			recv_err = netconn_recv(instance->newconn, &rx_netbuf);
-			if ( recv_err == ERR_OK)
-			{
-				// Navigate trough netbuffs until dump all data
-				do
-				{
-					netbuf_data(rx_netbuf, &rx_data, &rx_data_len);
-					process_incoming_bytes (rx_data, rx_data_len, instance);
-
-				}while(  netbuf_next(rx_netbuf) >= 0 );
-
-				netbuf_delete( rx_netbuf );
-			}
-		}
-	}
-}
-
-
-
-uint16_t telnet_transmit(uint8_t* buff, uint16_t len)
-{
-  //TODO: flexibility for ISR context
-  int ret;
-
-  if( instance->serial_input_stream == NULL )
-	  return 0;
-  
-  if( instance->status != TELNET_CONN_STATUS_CONNECTED )
-	  return 0;
-
-  // Send char to stream buffer of the associated instance
-  //taskENTER_CRITICAL();
-  ret = xStreamBufferSend(instance->serial_input_stream, buff, len, 100);
-  //taskEXIT_CRITICAL();
-
-  return ret;
-}
-
-
-
 
