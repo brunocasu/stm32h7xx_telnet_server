@@ -65,13 +65,13 @@ static void netconn_cb (struct netconn *conn, enum netconn_evt evt, u16_t len);
 
 // Task and attributes
 
-const osThreadAttr_t wrt_task_attributes = {
+static const osThreadAttr_t wrt_task_attributes = {
   .name = "TelnetWrtTask",
   .priority = (osPriority_t) osPriorityNormal,
   .stack_size = 256 * 4
 };
 
-const osThreadAttr_t rcv_task_attributes = {
+static const osThreadAttr_t rcv_task_attributes = {
   .name = "TelnetRcvTask",
   .priority = (osPriority_t) osPriorityNormal,
   .stack_size = 128 * 4
