@@ -74,7 +74,7 @@ static const osThreadAttr_t wrt_task_attributes = {
 static const osThreadAttr_t rcv_task_attributes = {
   .name = "TelnetRcvTask",
   .priority = (osPriority_t) osPriorityNormal,
-  .stack_size = 128 * 4
+  .stack_size = (256) * 4
 };
 
 // Task functions
