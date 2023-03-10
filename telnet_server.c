@@ -135,8 +135,11 @@ void netconn_cb (struct netconn *conn, enum netconn_evt evt, u16_t len)
 			// Switch the connection status according to the current one
 			if( instance->status == TELNET_CONN_STATUS_ACCEPTING)
 				instance->status = TELNET_CONN_STATUS_CONNECTED;
-			else
-				instance->status = TELNET_CONN_STATUS_CLOSING;
+			else {
+				if (instance->newconn == conn) {
+					instance->status = TELNET_CONN_STATUS_CLOSING;
+				}
+			}
 		}
 	}
 }
@@ -174,6 +177,8 @@ static void wrt_task (void *arg)
 		  // Transfer loop
 		  for(;;)
 		  {
+			  netconn_close (instance->conn); // Stop listening.
+
 			  vTaskDelay( tx_cycle_period );
 
 			  xSemaphoreTake( instance->buff_mutex, portMAX_DELAY );
@@ -194,6 +199,22 @@ static void wrt_task (void *arg)
 
 		  netconn_close (instance->newconn);
 		  netconn_delete(instance->newconn);
+
+		  // Start listening again
+		  netconn_delete(instance->conn);
+
+		  instance->conn = netconn_new_with_callback(NETCONN_TCP, netconn_cb);
+		  if( instance->conn == NULL )
+		  		return;
+
+		  	err = netconn_bind(instance->conn, NULL, instance->tcp_port);
+		  	if ( err != ERR_OK )
+		  		return;
+
+		  	netconn_listen(instance->conn);
+
+		  	// No connection still established
+		  	instance->status = TELNET_CONN_STATUS_NONE;
 	  }
   }
 }
